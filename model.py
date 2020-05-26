@@ -7,7 +7,7 @@ from common import Common
 
 
 # TODO: Fix this... 
-config = Config.get_default_config(None)
+config = Config.get_debug_config(None)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -79,39 +79,41 @@ class Decoder(nn.Module):
         
         self.embedding_target = nn.Embedding(target_input_dim, 
                                              config.DECODER_SIZE)
+        self.num_layers = 2
         self.lstm = nn.LSTMCell(config.DECODER_SIZE, config.DECODER_SIZE)
 
         self.lin = nn.Linear(config.DECODER_SIZE * 2, 
                              target_input_dim, bias=False)
 
-    def forward(self, seqs, hidden, attention):
+    def forward(self, seqs, hidden, encode_out, context_mask, attention):
         # (batch, max_target, embed_dim) -> (batch, embed_dim)
         emb = self.embedding_target(seqs).squeeze(0)
 
-        _, hidden = self.lstm(emb, hidden)
+        decode_out, hidden = self.lstm(emb, hidden)
+
+        # (batch, decode_size)
+        attention = attention(encode_out, context_mask, decode_out)
 
         # (batch, 2 * decode_size)
-        output = torch.cat([hidden, attention], dim=1)
+        output = torch.cat([decode_out, attention], dim=1)
         # (batch, target_input_dim)
         output = torch.tanh(self.lin(output))
 
-        return output, hidden
+        return output, (decode_out, hidden)
 
 
 class Code2Seq(nn.Module):
     def __init__(self, dictionaries):
         super(Code2Seq, self).__init__()
 
-        self.dict = dictionaries
-        self.encoder = Encoder(self.dict.subtoken_vocab_size,
-                               self.dict.nodes_vocab_size)
-        self.decoder = Decoder(self.dict.target_vocab_size)
+        self.dict_ = dictionaries
+        self.encoder = Encoder(self.dict_.subtoken_vocab_size,
+                               self.dict_.nodes_vocab_size)
+        self.decoder = Decoder(self.dict_.target_vocab_size)
 
-    def attention(self, encode_context, context_mask, hidden):
-        h_t, _ = hidden[0]
-
+    def attention(self, encode_context, context_mask, decode_out):
         # (batch, max_target)
-        attn = torch.bmm(encode_context, h_t.unsqueeze(-1)).squeeze(-1)
+        attn = torch.bmm(encode_context, decode_out.unsqueeze(-1)).squeeze(-1)
 
         # (batch, max_target)
         #n_context_mask = (context_mask == 0).type(torch.float) * -100000
@@ -141,34 +143,53 @@ class Code2Seq(nn.Module):
         # (batch, decode_size)
         init_state = contexts_sum / context_length
 
+        h_t = init_state.clone()
+        c_t = init_state.clone()
+        decoder_hidden = (h_t, c_t)
+
         # (h_t, c_t)
-        fake_encoder_state = tuple([init_state, init_state] for _ in
-                                   range(config.NUM_DECODER_LAYERS))
+        #decoder_hidden = tuple([init_state, init_state] for _ in
+                               #range(config.NUM_DECODER_LAYERS))
 
         # Empty input to decoder, only containing start-of-sequence tag
-        SOS_token = self.dict.target_to_index[Common.SOS]
+        SOS_token = self.dict_.target_to_index[Common.SOS]
         decoder_input = torch.tensor([SOS_token] * config.BATCH_SIZE, 
                                      dtype=torch.long).to(device)
         # (1, batch)
         decoder_input = decoder_input.unsqueeze(0)
 
         # holds output
-        decoder_outputs = torch.zeros(config.MAX_TARGET_PARTS+1, 
+        decoder_outputs = torch.zeros(config.MAX_TARGET_PARTS,
                                       config.BATCH_SIZE, 
-                                      self.dict.target_vocab_size).to(device)
+                                      self.dict_.target_vocab_size).to(device)
 
-        for t in range(config.MAX_TARGET_PARTS + 1):
-            attn = self.attention(encode_context, context_mask, fake_encoder_state)
+        for t in range(config.MAX_TARGET_PARTS):
+            #attn = self.attention(encode_context, context_mask, decoder_hidden)
             
             decoder_output, decoder_hidden = self.decoder(decoder_input, 
-                                                          *fake_encoder_state, 
-                                                          attn)
-
+                                                          decoder_hidden, 
+                                                          encode_context,
+                                                          context_mask,
+                                                          self.attention)
             decoder_outputs[t] = decoder_output
 
             if self.training:
-                decoder_input = target[:,t].unsqueeze(0)
+                decoder_input = target.transpose(0,1)[t+1].unsqueeze(0)
             else:
                 decoder_input = decoder_output.max(-1)[1] 
 
         return decoder_outputs
+
+    def get_evaluation(self, predicted, targets):
+        true_positive, false_positive, false_negative = 0, 0, 0
+
+        for pred, targ in zip(predicted, targets):
+            for word in pred:
+                if Common.word_not_meta_token(word, self.dict_.target_to_index):
+                    if word in targ: true_positive += 1
+                    else: false_positive += 1
+            for word in targ:
+                if Common.word_not_meta_token(word, self.dict_.target_to_index):
+                    if word not in pred: false_negative += 1
+
+        return true_positive, false_positive, false_negative
